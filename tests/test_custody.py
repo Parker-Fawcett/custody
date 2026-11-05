@@ -147,6 +147,33 @@ def main() -> int:
     profiles = [t for t in b.targets if t.path and "AppData" in t.path]
     check("incident exposes profile-root targets", len(profiles) >= 3, True)
 
+    # the same command wrapped for a POSIX terminal tool: the shell field says
+    # posix, the process is PowerShell, so the array bug still has to be found
+    wrapped = "pwsh -NoProfile -Command " + repr(incident)
+    w = policy.Re.analyze(wrapped, shell="posix", env=env, cwd=str(project))
+    check("pwsh wrapper is read as PowerShell", len(w.targets), 7)
+    check("pwsh wrapper keeps the precedence note",
+          any("8 array element(s)" in n for n in w.notes), True)
+
+    directive, _, _ = policy.evaluate(wrapped, "posix", led, env, str(project))
+    check("pwsh wrapper escalates through the gate",
+          directive and directive["action"], "approve")
+
+    # PS syntax straight into the call, no wrapper at all
+    bare = "Remove-Item -Recurse -Force C:\\Windows\\Temp, $env:LOCALAPPDATA\\pip"
+    check("bare PowerShell verbs are recognised under posix",
+          policy.Re.effective_shell(bare), "powershell")
+    b2 = policy.Re.analyze(bare, shell="posix", env=env, cwd=str(project))
+    check("bare PowerShell argument list resolves", len(b2.targets), 2)
+    check("bare PowerShell variable-plus-suffix is literal",
+          any(t.path and t.path.endswith("pip") for t in b2.targets), True)
+
+    check("plain posix command keeps the posix shell",
+          policy.Re.effective_shell("rm -rf ./build"), "posix")
+    check("plain posix delete still resolves",
+          len(policy.Re.analyze("rm -rf ./build", shell="posix", env=env,
+                                cwd=str(project)).targets), 1)
+
     print(text)
     print()
     print("=" * 70)

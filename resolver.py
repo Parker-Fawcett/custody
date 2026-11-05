@@ -10,6 +10,7 @@ text are different objects; this module computes the second one.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 from dataclasses import dataclass, field
@@ -343,6 +344,9 @@ def expand_posix(word: str, env: dict[str, str], cwd: str) -> tuple[str | None, 
 # --------------------------------------------------------------------------
 
 _PS_VAR = re.compile(r"\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+_PS_VAR_PREFIX = re.compile(
+    r"(?i)^(?P<var>\$(?:env:)?[A-Za-z_][A-Za-z0-9_]*)(?P<rest>[^A-Za-z0-9_].*)$"
+)
 _PS_SAFE = {
     "env:temp", "env:tmp", "env:localappdata", "env:appdata", "env:userprofile",
     "env:username", "env:homepath", "env:programdata", "env:systemroot",
@@ -515,6 +519,22 @@ def _ps_scalar(value: str, env: dict[str, str], cwd: str, *, finish: bool = True
             return (val, "") if not finish else (_finish_ps_path(val, cwd), "")
         return None, f"{value} is not a variable this resolver expands"
 
+    # argument mode concatenates a variable with the literal that follows it:
+    # $env:LOCALAPPDATA\pip is one argument, not a variable and a suffix
+    m = _PS_VAR_PREFIX.match(value)
+    if m:
+        key = m.group("var").lower().lstrip("$")
+        rest = m.group("rest")
+        if key in _PS_SAFE and rest[:1] not in (".", "[") and "$" not in rest:
+            name = key.split(":", 1)[-1].upper()
+            val = env.get(name)
+            if val is None:
+                return None, f"{m.group('var')} is not set in this environment"
+            joined = val + rest
+            return (joined, "") if not finish else (_finish_ps_path(joined, cwd), "")
+        if key not in _PS_SAFE:
+            return None, f"{m.group('var')} is not a variable this resolver expands"
+
     if any(ch in value for ch in "(){}|&;"):
         return None, "contains an expression this resolver does not evaluate"
 
@@ -557,10 +577,56 @@ APP_KILL_VERBS = {"killall", "pkill", "taskkill"}
 _REDIRECT = re.compile(r"(?<![0-9&])>>?\s*([^\s;|&<>]+)")
 
 
+PS_SHELLS = ("powershell", "pwsh", "windows", "cmd")
+
+# A PowerShell command reaches a POSIX terminal tool in more than one shape: a
+# wrapper (`pwsh -Command '...'` or `pwsh -EncodedCommand ...`), or PS syntax
+# written straight into the call. Taken at face value the shell field says
+# "posix", everything parses as POSIX, and a PS delete reads as harmless.
+_PS_WRAPPER = re.compile(
+    r"""(?ix)^\s*(?:pwsh|powershell)(?:\.exe)?\b
+        (?:\s+-(?:noprofile|noninteractive|noexit|nologo|windowstyle
+                  |workingdirectory|wd|executionpolicy|ep|inputformat
+                  |outputformat)\s+\S+)*
+        \s+-(?P<flag>encodedcommand|enc|command|c)\s+(?P<payload>.+)$"""
+)
+_PS_MARKERS = re.compile(
+    r"(?i)(?:\$env:|\bRemove-Item\b|\bClear-Content\b|\bCopy-Item\b|\bMove-Item\b"
+    r"|\bGet-ChildItem\b|\bOut-File\b|\bSet-Content\b|\bNew-Item\b|-LiteralPath\b"
+    r"|-Recurse\b|\[System\.IO)"
+)
+
+
+def ps_payload(command: str) -> str | None:
+    """The inner script when a call just wraps PowerShell. None when it does not."""
+    m = _PS_WRAPPER.match(command.strip())
+    if not m:
+        return None
+    payload = m.group("payload").strip()
+    if m.group("flag").lower() in ("enc", "encodedcommand"):
+        try:
+            raw = base64.b64decode(payload.strip("'\""))
+            return raw.decode("utf-16-le", "replace")
+        except Exception:
+            return None
+    if len(payload) >= 2 and payload[0] == payload[-1] and payload[0] in "'\"":
+        return payload[1:-1]
+    return payload
+
+
+def effective_shell(command: str, shell: str = "posix") -> str:
+    """The shell that will read this command, not the one the call declared."""
+    if shell.lower() in PS_SHELLS:
+        return shell
+    if ps_payload(command) is not None or _PS_MARKERS.search(command):
+        return "powershell"
+    return shell
+
+
 def detect(command: str, shell: str = "posix") -> list[Detected]:
     """Find destructive operations in a command. Empty list means nothing to check."""
-    if shell.lower() in ("powershell", "pwsh", "windows", "cmd"):
-        return _detect_powershell(command)
+    if shell.lower() in PS_SHELLS:
+        return _detect_powershell(ps_payload(command) or command)
     return _detect_posix(command)
 
 
@@ -646,6 +712,39 @@ def _ps_array_groups(command: str) -> list[str]:
     return groups
 
 
+def split_ps_words(text: str) -> list[str]:
+    """Split a PowerShell argument list.
+
+    PowerShell is not POSIX: a backslash is a path separator, not an escape, so
+    'C:\\Windows\\Temp' must survive splitting intact. Quotes are kept so the
+    expander can tell a literal 'string' from an expandable "string".
+    """
+    words: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+
+    for ch in text:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch.isspace():
+            if buf:
+                words.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+
+    if buf:
+        words.append("".join(buf))
+    return words
+
+
 def _detect_powershell(command: str) -> list[Detected]:
     found: list[Detected] = []
 
@@ -656,7 +755,7 @@ def _detect_powershell(command: str) -> list[Detected]:
         stripped = simple.strip()
         if not stripped:
             continue
-        words = split_words(stripped)
+        words = split_ps_words(stripped)
         if not words:
             continue
         head = words[0].lower()
@@ -670,7 +769,7 @@ def _detect_powershell(command: str) -> list[Detected]:
             for w in words[1:]:
                 if w.startswith("-"):
                     continue
-                args.append(w)
+                args.append(w.rstrip(","))  # 'A, B' is a two-element array in argument mode
             if args:
                 found.append(Detected("Remove-Item", args, "powershell"))
 
@@ -699,6 +798,7 @@ def analyze(
     probe_fs: bool = True,
 ) -> Blast | None:
     """Resolve everything a command will touch. None when nothing is destructive."""
+    shell = effective_shell(command, shell)
     ops = detect(command, shell)
     if not ops:
         return None
@@ -727,7 +827,10 @@ def analyze(
                 for p in paths:
                     blast.targets.append(_resolve_one(p, raw, probe_fs))
             else:
-                path, why = expand_posix(raw, env, cwd)
+                if shell.lower() in PS_SHELLS:
+                    path, why = expand_ps_value(raw, env, cwd)
+                else:
+                    path, why = expand_posix(raw, env, cwd)
                 blast.targets.append(_resolve_one(path, raw, probe_fs, why))
 
     blast.notes = list(dict.fromkeys(blast.notes))
