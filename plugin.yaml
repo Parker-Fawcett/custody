@@ -3,7 +3,7 @@ version: 0.1.0
 manifest_version: 2
 api_version: 1
 license: MIT
-homepage: https://github.com/parkerfawcett/custody
+homepage: https://github.com/Parker-Fawcett/custody
 author: Parker Fawcett
 requires_hermes: ">=0.22.7"
 description: >-
