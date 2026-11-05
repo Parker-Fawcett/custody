@@ -1,0 +1,39 @@
+name: custody
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+license: MIT
+homepage: https://github.com/parkerfawcett/custody
+author: Parker Fawcett
+requires_hermes: ">=0.22.7"
+description: >-
+  Resolve what a destructive terminal command will actually touch before it runs,
+  attribute every target to the current session's provenance, and escalate anything
+  the agent did not create. Expands shell semantics (variable expansion, PowerShell
+  ',' vs '+', quoting) into a concrete target set with file counts, then sends
+  user-owned and protected paths to the human approval gate. Fails closed on
+  unresolvable targets.
+tags: [safety, approvals, terminal, provenance]
+provides_tools:
+  - custody_explain
+  - custody_ledger
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start
+config_schema:
+  mode:
+    type: str
+    choices: [enforce, observe]
+    default: enforce
+    label: Mode
+    description: >-
+      enforce asks before a destructive call touches anything this session did not
+      create. observe records the same analysis without interrupting anything.
+  extra_protected:
+    type: list
+    default: []
+    label: Extra protected paths
+    description: >-
+      Additional absolute paths to treat as protected, on top of the built-in
+      system and profile roots.
